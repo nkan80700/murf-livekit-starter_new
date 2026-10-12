@@ -3,7 +3,7 @@ import logging
 import os
 import sqlite3
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Annotated
 
 import aiohttp
@@ -39,6 +39,10 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("agent")
 
 load_dotenv(".env.local")
+
+# Supabase (conversation history). Railway / .env.local me ye 2 variables set karo.
+SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
+SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY", "")
 
 
 # ============================================================
@@ -152,6 +156,82 @@ def log_call_end(call_id: str, outcome: str, reason: str = ""):
     )
     conn.commit()
     conn.close()
+
+
+# ============================================================
+# CONVERSATION HISTORY (Supabase)
+# ============================================================
+
+
+def history_to_messages(session: AgentSession) -> list[dict]:
+    """Chat history se sirf user/assistant ke text messages nikalta hai."""
+    messages: list[dict] = []
+    for item in session.history.items:
+        if getattr(item, "type", None) != "message":
+            continue
+        role = getattr(item, "role", None)
+        if role not in ("user", "assistant"):
+            continue
+
+        text = getattr(item, "text_content", None)
+        if text is None:
+            parts = [c for c in getattr(item, "content", []) if isinstance(c, str)]
+            text = " ".join(parts)
+
+        text = (text or "").strip()
+        if text:
+            messages.append({"role": role, "text": text})
+    return messages
+
+
+def supabase_headers() -> dict:
+    headers = {
+        "apikey": SUPABASE_SERVICE_KEY,
+        "Content-Type": "application/json",
+        "Prefer": "return=minimal",
+    }
+    # Naye keys (sb_secret_...) JWT nahi hote, unhe sirf apikey header me bhejte hain
+    if not SUPABASE_SERVICE_KEY.startswith("sb_"):
+        headers["Authorization"] = f"Bearer {SUPABASE_SERVICE_KEY}"
+    return headers
+
+
+async def save_conversation(
+    *,
+    room_name: str,
+    mode: str,
+    started_at: str,
+    ended_at: str,
+    messages: list[dict],
+):
+    if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
+        logger.warning("SUPABASE_URL / SUPABASE_SERVICE_KEY not set - conversation not saved.")
+        return
+
+    payload = {
+        "room_name": room_name,
+        "mode": mode,
+        "started_at": started_at,
+        "ended_at": ended_at,
+        "messages": messages,
+    }
+
+    try:
+        timeout = aiohttp.ClientTimeout(total=10)
+        async with aiohttp.ClientSession(timeout=timeout) as http:
+            async with http.post(
+                f"{SUPABASE_URL}/rest/v1/conversations",
+                json=payload,
+                headers=supabase_headers(),
+            ) as resp:
+                if resp.status >= 300:
+                    logger.error(
+                        "Supabase save failed (%s): %s", resp.status, await resp.text()
+                    )
+                else:
+                    logger.info("Conversation saved (%d messages).", len(messages))
+    except Exception as error:
+        logger.error("Supabase save error: %s", error)
 
 
 # ============================================================
@@ -373,6 +453,16 @@ async def my_agent(ctx: JobContext):
     ctx.log_context_fields = {"room": ctx.room.name}
     call_id = uuid.uuid4().hex[:8]
     state = CallState(call_id=call_id)
+    started_at = datetime.now(timezone.utc).isoformat()
+
+    # App "mode" participant attribute me bhejta hai (interview / english / ...)
+    call_meta = {"mode": "neo"}
+
+    @ctx.room.on("participant_attributes_changed")
+    def on_attributes_changed(changed_attributes: dict, participant: rtc.Participant):
+        mode = changed_attributes.get("mode")
+        if mode:
+            call_meta["mode"] = mode
 
     channel = "browser"
     if ctx.job.metadata:
@@ -405,6 +495,18 @@ async def my_agent(ctx: JobContext):
     async def on_shutdown():
         log_call_end(call_id, "completed", "Call ended by user or system.")
 
+        messages = history_to_messages(session)
+        if any(m["role"] == "user" for m in messages):
+            await save_conversation(
+                room_name=ctx.room.name,
+                mode=call_meta["mode"],
+                started_at=started_at,
+                ended_at=datetime.now(timezone.utc).isoformat(),
+                messages=messages,
+            )
+        else:
+            logger.info("No user speech - conversation not saved.")
+
     ctx.add_shutdown_callback(on_shutdown)
 
     await session.start(
@@ -424,6 +526,12 @@ async def my_agent(ctx: JobContext):
     )
 
     await ctx.connect()
+
+    # Agar app ne connect hote hi mode bhej diya ho
+    for participant in ctx.room.remote_participants.values():
+        mode = participant.attributes.get("mode")
+        if mode:
+            call_meta["mode"] = mode
 
     # Open-ended, friendly greeting
     await session.say(
